@@ -13,6 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as data
 import tqdm
+import gc
+
 from transformer_lens import HookedTransformer
 from transformers import GPT2Tokenizer
 
@@ -23,19 +25,69 @@ from activation_dataset import (check_transformerlens_model,
 from autoencoders.learned_dict import LearnedDict, TiedSAE, UntiedSAE
 from cluster_runs import dispatch_job_on_chunk
 from sc_datasets.random_dataset import SparseMixDataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+
+# def get_model(cfg):
+#     if check_transformerlens_model(cfg.model_name):
+#         model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device)
+#         if hasattr(model, "tokenizer"):
+#             tokenizer = model.tokenizer
+#         else:
+#             print("Using default tokenizer from gpt2")
+#             tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+#     else:
+#         print(f"Loading HuggingFace model {cfg.model_name}...")
+#         model = AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=torch.float16, device_map="auto")
+#         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+
+#     return model, tokenizer
 
 def get_model(cfg):
     if check_transformerlens_model(cfg.model_name):
-        model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device)
-    else:
-        raise ValueError("Model name not recognised")
+        # Check if it's a LLaMA model
+        if "llama" in cfg.model_name.lower():
+            # Load the HF model first
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                cfg.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto"
+            )
 
-    if hasattr(model, "tokenizer"):
-        tokenizer = model.tokenizer
+            model = HookedTransformer.from_pretrained(
+                cfg.model_name,
+                device=cfg.device,
+                hf_model=hf_model,
+            )
+        else:
+            model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device)
+
+        tokenizer = model.tokenizer if hasattr(model, "tokenizer") else GPT2Tokenizer.from_pretrained("gpt2")
+
     else:
-        print("Using default tokenizer from gpt2")
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        print("Using HuggingFace model")
+
+        if getattr(cfg, "use_4bit", False):
+            print("Loading model in 4bit")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto"
+            )
+
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
     return model, tokenizer
 
@@ -165,8 +217,13 @@ def ensemble_train_loop(ensemble, cfg, args, ensemble_name, sampler, dataset, pr
         run = cfg.wandb_instance
 
     for i, batch_idxs in enumerate(sampler):
-        batch = dataset[batch_idxs].to(args["device"])
-        losses, aux_buffer = ensemble.step_batch(batch)
+        try:
+            batch = dataset[batch_idxs].to(args["device"])
+            losses, aux_buffer = ensemble.step_batch(batch)
+        except torch.cuda.OutOfMemoryError:
+            print(f"OOM at dict_ratio={args.get('dict_ratio', 'unknown')} batch {i}, skipping...")
+            torch.cuda.empty_cache()
+            continue
 
         num_nonzero = aux_buffer["c"].count_nonzero(dim=-1).float().mean(dim=-1)
 
@@ -237,33 +294,75 @@ def generate_synthetic_dataset(cfg, generator, chunk_size, n_chunks):
         torch.save(chunk, os.path.join(cfg.dataset_folder, f"{i}.pt"))
 
 
+# def init_model_dataset(cfg):
+#     cfg.activation_width = get_activation_size(cfg.model_name, cfg.layer_loc)
+
+#     if len(os.listdir(cfg.dataset_folder)) == 0:
+#         print(f"Activations in {cfg.dataset_folder} do not exist, creating them")
+#         transformer, tokenizer = get_model(cfg)
+#         n_datapoints = setup_data(
+#             tokenizer,
+#             transformer,
+#             dataset_name=cfg.dataset_name,
+#             dataset_folder=cfg.dataset_folder,
+#             layer=cfg.layer,
+#             layer_loc=cfg.layer_loc,
+#             n_chunks=cfg.n_chunks,
+#             device=cfg.device,
+#             chunk_size_gb=cfg.chunk_size_gb,
+#             center_dataset=cfg.center_dataset,
+#         )
+#         del transformer, tokenizer
+#         return n_datapoints
+#     else:
+#         print(f"Activations in {cfg.dataset_folder} already exist, loading them")
+#         n_datapoints = 0
+#         n_files = len(os.listdir(cfg.dataset_folder))
+#         for i in tqdm.tqdm(range(n_files)):
+#             n_datapoints += torch.load(os.path.join(cfg.dataset_folder, f"{i}.pt"), map_location="cpu").shape[0]
+#         return n_datapoints
+
+from activation_dataset import setup_data, setup_data_new
+
 def init_model_dataset(cfg):
     cfg.activation_width = get_activation_size(cfg.model_name, cfg.layer_loc)
 
     if len(os.listdir(cfg.dataset_folder)) == 0:
         print(f"Activations in {cfg.dataset_folder} do not exist, creating them")
         transformer, tokenizer = get_model(cfg)
-        n_datapoints = setup_data(
-            tokenizer,
-            transformer,
-            dataset_name=cfg.dataset_name,
-            dataset_folder=cfg.dataset_folder,
-            layer=cfg.layer,
-            layer_loc=cfg.layer_loc,
-            n_chunks=cfg.n_chunks,
-            device=cfg.device,
-            chunk_size_gb=cfg.chunk_size_gb,
-            center_dataset=cfg.center_dataset,
-        )
-        del transformer, tokenizer
-        return n_datapoints
-    else:
-        print(f"Activations in {cfg.dataset_folder} already exist, loading them")
-        n_datapoints = 0
-        n_files = len(os.listdir(cfg.dataset_folder))
-        for i in tqdm.tqdm(range(n_files)):
-            n_datapoints += torch.load(os.path.join(cfg.dataset_folder, f"{i}.pt"), map_location="cpu").shape[0]
-        return n_datapoints
+
+        if not check_transformerlens_model(cfg.model_name):
+            print("Detected HuggingFace model, using setup_data_new")
+            max_length = 512
+            chunk_size = int(cfg.chunk_size_gb * 1024 ** 3)
+            setup_data_new(
+                model_name=cfg.model_name,
+                dataset_name=cfg.dataset_name,
+                output_folder=cfg.dataset_folder,
+                tensor_names=[f"model.layers.{cfg.layer}.input_layernorm"],
+                chunk_size=chunk_size,
+                n_chunks=cfg.n_chunks,
+                device=cfg.device,
+                max_length=max_length,
+                model_batch_size=cfg.batch_size,
+                precision="float16",
+                shuffle_seed=42,
+            )
+        else:
+            n_datapoints = setup_data(
+                tokenizer,
+                transformer,
+                dataset_name=cfg.dataset_name,
+                dataset_folder=cfg.dataset_folder,
+                layer=cfg.layer,
+                layer_loc=cfg.layer_loc,
+                n_chunks=cfg.n_chunks,
+                device=cfg.device,
+                chunk_size_gb=cfg.chunk_size_gb,
+                center_dataset=cfg.center_dataset,
+            )
+            del transformer, tokenizer
+            return n_datapoints
 
 
 def init_synthetic_dataset(cfg):
@@ -319,8 +418,10 @@ def sweep(ensemble_init_func, cfg):
         )
 
     if cfg.use_synthetic_dataset:
+        cfg.device = "cuda:0"
         init_synthetic_dataset(cfg)
     else:
+        cfg.device = "cuda:0"
         init_model_dataset(cfg)
 
     print("Initialising ensembles...", end=" ")
@@ -344,7 +445,11 @@ def sweep(ensemble_init_func, cfg):
 
     print("Ensembles initialised.")
 
-    n_chunks = len(os.listdir(cfg.dataset_folder))
+    n_chunks = len([
+        f for f in os.listdir(cfg.dataset_folder)
+        if f.endswith(".pt") and f[:-3].isdigit()
+    ])
+
 
     chunk_order = np.random.permutation(n_chunks)
 
@@ -355,7 +460,7 @@ def sweep(ensemble_init_func, cfg):
         print(f"Chunk {i+1}/{len(chunk_order)}")
 
         chunk_loc = os.path.join(cfg.dataset_folder, f"{chunk_idx}.pt")
-        chunk = torch.load(chunk_loc).to(device="cpu", dtype=torch.float32)
+        chunk = torch.load(chunk_loc).to(device='cpu', dtype=torch.float32)
         if cfg.center_activations:
             if i == 0:
                 print("Centring activations")
@@ -379,8 +484,22 @@ def sweep(ensemble_init_func, cfg):
             cfg.iter_folder = os.path.join(cfg.output_folder, f"_{i}")
             os.makedirs(cfg.iter_folder, exist_ok=True)
             torch.save(learned_dicts, os.path.join(cfg.iter_folder, "learned_dicts.pt"))
+
+            cfg_dict = {}
+            for k, v in vars(cfg).items():
+                if isinstance(v, torch.device):
+                    cfg_dict[k] = str(v)
+                elif isinstance(v, torch.dtype):
+                    cfg_dict[k] = str(v)
+                elif isinstance(v, torch.Tensor):
+                    cfg_dict[k] = v.tolist()
+                elif isinstance(v, (int, float, str, list, dict, bool, type(None))):
+                    cfg_dict[k] = v
+                else:
+                    cfg_dict[k] = str(v)
+            
             # save the config as a yaml file
             with open(os.path.join(cfg.iter_folder, "config.yaml"), "w") as f:
-                yaml.dump(dict(cfg), f)
+                yaml.dump(cfg_dict, f)
 
         print("\n")

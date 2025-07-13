@@ -32,6 +32,7 @@ with open("secrets.json") as f:
     os.environ["OPENAI_API_KEY"] = secrets["openai_key"]
 
 mp.set_start_method("spawn", force=True)
+np.seterr(divide='raise', invalid='raise')
 
 from neuron_explainer.activations.activation_records import \
     calculate_max_activation
@@ -46,19 +47,22 @@ from neuron_explainer.explanations.scoring import (
     aggregate_scored_sequence_simulations, simulate_and_score)
 from neuron_explainer.explanations.simulator import ExplanationNeuronSimulator
 from neuron_explainer.fast_dataclasses import loads
+from neuron_explainer.explanations.few_shot_examples import FewShotExampleSet
+from neuron_explainer.explanations.simulator import LogprobFreeExplanationTokenSimulator
 
-EXPLAINER_MODEL_NAME = "gpt-4"  # "gpt-3.5-turbo"
-SIMULATOR_MODEL_NAME = "text-davinci-003"
+EXPLAINER_MODEL_NAME = "gpt-3.5-turbo"
+SIMULATOR_MODEL_NAME = "gpt-3.5-turbo"
 
-OPENAI_MAX_FRAGMENTS = 50000
-OPENAI_FRAGMENT_LEN = 64
+
+OPENAI_MAX_FRAGMENTS = 8000
+OPENAI_FRAGMENT_LEN = 32
 OPENAI_EXAMPLES_PER_SPLIT = 5
 N_SPLITS = 4
 TOTAL_EXAMPLES = OPENAI_EXAMPLES_PER_SPLIT * N_SPLITS
 REPLACEMENT_CHAR = "�"
 MAX_CONCURRENT: Any = None
 
-BASE_FOLDER = "/mnt/ssd-cluster/sweep_interp"
+BASE_FOLDER = "./mnt/ssd-cluster/sweep_interp"
 
 
 # Replaces the load_neuron function in neuron_explainer.activations.activations because couldn't get blobfile to work
@@ -84,7 +88,7 @@ def make_feature_activation_dataset(
     learned_dict: LearnedDict,
     layer: int,
     layer_loc: str,
-    device: str = "cpu",
+    device: str = "gpu",
     n_fragments=OPENAI_MAX_FRAGMENTS,
     max_features: int = 0,  # number of features to store activations for, 0 for all
     random_fragment=True,  # used for debugging
@@ -105,7 +109,8 @@ def make_feature_activation_dataset(
     else:
         feat_dim = learned_dict.n_feats
 
-    sentence_dataset = load_dataset("openwebtext", split="train", streaming=True)
+    # sentence_dataset = load_dataset("openwebtext", split="train", streaming=True)
+    sentence_dataset = load_dataset("openai/gsm8k", split="train")
 
     if model.cfg.model_name == "nanoGPT":
         tokenizer_model = HookedTransformer.from_pretrained("gpt2", device=device)
@@ -138,24 +143,50 @@ def make_feature_activation_dataset(
                     f"Added {n_added} fragments, thrown {n_thrown} fragments\t\t\t\t\t\t",
                     end="\r",
                 )
-                sentence = next(iter_dataset)
+                try:
+                    sentence = next(iter_dataset)
+                except StopIteration:
+                    print("Dataset exhausted, exit inner loop")
+                    break
+                # sentence = next(iter_dataset)
                 # split the sentence into fragments
-                sentence_tokens = tokenizer_model.to_tokens(sentence["text"], prepend_bos=False).to(device)
+                # sentence_tokens = tokenizer_model.to_tokens(sentence["text"], prepend_bos=False).to(device)
+                sentence_tokens = tokenizer_model.to_tokens(sentence["question"], prepend_bos=False).to(device)
                 n_tokens = sentence_tokens.shape[1]
-                # get a random fragment from the sentence - only taking one fragment per sentence so examples aren't correlated]
-                if random_fragment:
-                    token_start = np.random.randint(0, n_tokens - OPENAI_FRAGMENT_LEN)
+                # # get a random fragment from the sentence - only taking one fragment per sentence so examples aren't correlated]
+                # if random_fragment:
+                #     token_start = np.random.randint(0, n_tokens - OPENAI_FRAGMENT_LEN)
+                # else:
+                #     token_start = 0
+                # fragment_tokens = sentence_tokens[:, token_start : token_start + OPENAI_FRAGMENT_LEN]
+                # token_strs = tokenizer_model.to_str_tokens(fragment_tokens[0])
+                # if REPLACEMENT_CHAR in token_strs:
+                #     n_thrown += 1
+                #     continue
+
+
+                if n_tokens > OPENAI_FRAGMENT_LEN:
+                    fragment_tokens = sentence_tokens[:, :OPENAI_FRAGMENT_LEN]
+                elif n_tokens < OPENAI_FRAGMENT_LEN:
+                    pad_len = OPENAI_FRAGMENT_LEN - n_tokens
+                    if hasattr(tokenizer_model, "tokenizer") and tokenizer_model.tokenizer.pad_token_id is not None:
+                        pad_token_id = tokenizer_model.tokenizer.pad_token_id
+                    else:
+                        pad_token_id = 0
+                    padding = torch.full((1, pad_len), pad_token_id, dtype=sentence_tokens.dtype, device=device)
+                    fragment_tokens = torch.cat([sentence_tokens, padding], dim=1)
                 else:
-                    token_start = 0
-                fragment_tokens = sentence_tokens[:, token_start : token_start + OPENAI_FRAGMENT_LEN]
-                token_strs = tokenizer_model.to_str_tokens(fragment_tokens[0])
-                if REPLACEMENT_CHAR in token_strs:
-                    n_thrown += 1
-                    continue
-
-                fragment_strs.append(token_strs)
+                    fragment_tokens = sentence_tokens
+                    
                 fragments.append(fragment_tokens)
+                fragment_strs.append(tokenizer_model.to_str_tokens(fragment_tokens[0]))
 
+
+
+                
+            if len(fragments) == 0:
+                print("No more data available, exit outer loop")
+                break
             tokens = torch.cat(fragments, dim=0)
             assert tokens.shape == (batch_size, OPENAI_FRAGMENT_LEN), tokens.shape
 
@@ -175,6 +206,7 @@ def make_feature_activation_dataset(
                 token_ids = fragment_tokens[0].tolist()
 
                 feature_activation_data = learned_dict.encode(activation_data)
+
                 feature_activation_maxes = torch.max(feature_activation_data, dim=0)[0]
 
                 activation_maxes_table[n_added, :] = feature_activation_maxes.cpu().numpy()[:feat_dim]
@@ -331,6 +363,9 @@ async def interpret(base_df: pd.DataFrame, save_folder: str, n_feats_to_explain:
         train_activation_records = neuron_record.train_activation_records(slice_params)
         valid_activation_records = neuron_record.valid_activation_records(slice_params)
 
+        print("Valid activation records:", valid_activation_records)
+
+
         explainer = TokenActivationPairExplainer(
             model_name=EXPLAINER_MODEL_NAME,
             prompt_format=PromptFormat.HARMONY_V4,
@@ -346,15 +381,26 @@ async def interpret(base_df: pd.DataFrame, save_folder: str, n_feats_to_explain:
         print(f"Feature {feat_n}, {explanation=}")
 
         # Simulate and score the explanation.
-        format = PromptFormat.HARMONY_V4 if SIMULATOR_MODEL_NAME == "gpt-3.5-turbo" else PromptFormat.INSTRUCTION_FOLLOWING
+        # format = PromptFormat.HARMONY_V4 if SIMULATOR_MODEL_NAME == "gpt-3.5-turbo" else PromptFormat.INSTRUCTION_FOLLOWING
+        format = PromptFormat.HARMONY_V4
+        # simulator = UncalibratedNeuronSimulator(
+        #     ExplanationNeuronSimulator(
+        #         SIMULATOR_MODEL_NAME,
+        #         explanation,
+        #         max_concurrent=MAX_CONCURRENT,
+        #         prompt_format=format,
+        #     )
+        # )
         simulator = UncalibratedNeuronSimulator(
-            ExplanationNeuronSimulator(
-                SIMULATOR_MODEL_NAME,
-                explanation,
+            LogprobFreeExplanationTokenSimulator(
+                model_name=SIMULATOR_MODEL_NAME,
+                explanation=explanation,
                 max_concurrent=MAX_CONCURRENT,
+                few_shot_example_set=FewShotExampleSet.NEWER,
                 prompt_format=format,
             )
         )
+        
         scored_simulation = await simulate_and_score(simulator, valid_activation_records)
         score = scored_simulation.get_preferred_score()
         assert len(scored_simulation.scored_sequence_simulations) == 10
@@ -539,8 +585,8 @@ def worker(queue, device_id):
 
 
 def interpret_across_baselines(n_gpus: int = 3):
-    baselines_dir = "/mnt/ssd-cluster/baselines"
-    save_dir = "/mnt/ssd-cluster/auto_interp_results/"
+    baselines_dir = "./mnt/ssd-cluster/baselines"
+    save_dir = "./mnt/ssd-cluster/auto_interp_results/"
     os.makedirs(save_dir, exist_ok=True)
     base_cfg = InterpArgs()
 
@@ -582,8 +628,8 @@ def interpret_across_baselines(n_gpus: int = 3):
 
 def interpret_across_big_sweep(l1_val: float, n_gpus: int = 1):
     base_cfg = InterpArgs()
-    base_dir = "/mnt/ssd-cluster/bigrun0308"
-    save_dir = "/mnt/ssd-cluster/auto_interp_results/"
+    base_dir = "./mnt/ssd-cluster/bigrun0308"
+    save_dir = "./mnt/ssd-cluster/auto_interp_results/"
     
     n_chunks_training = 10
     os.makedirs(save_dir, exist_ok=True)
@@ -642,8 +688,8 @@ def interpret_across_big_sweep(l1_val: float, n_gpus: int = 1):
 
 def interpret_across_chunks(l1_val: float, n_gpus: int = 1):
     base_cfg = InterpArgs()
-    base_dir = "/mnt/ssd-cluster/longrun2408"
-    save_dir = "/mnt/ssd-cluster/auto_interp_results_overtime/"
+    base_dir = "./mnt/ssd-cluster/longrun2408"
+    save_dir = "./mnt/ssd-cluster/auto_interp_results_overtime/"
     os.makedirs(save_dir, exist_ok=True)
 
     all_folders = os.listdir(base_dir)
@@ -689,7 +735,7 @@ def interpret_across_chunks(l1_val: float, n_gpus: int = 1):
 
 
 def read_results(activation_name: str, score_mode: str) -> None:
-    results_folder = os.path.join("/mnt/ssd-cluster/auto_interp_results", activation_name)
+    results_folder = os.path.join("./mnt/ssd-cluster/auto_interp_results", activation_name)
 
     scores = read_scores(
         results_folder, score_mode
@@ -770,7 +816,7 @@ if __name__ == "__main__":
         else:
             score_modes = [cfg.score_mode]
  
-        base_path = "/mnt/ssd-cluster/auto_interp_results"
+        base_path = "./mnt/ssd-cluster/auto_interp_results"
 
         if cfg.run_all:
             activation_names = [x for x in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, x))]
@@ -782,6 +828,7 @@ if __name__ == "__main__":
                 read_results(activation_name, score_mode)
 
     elif len(sys.argv) > 1 and sys.argv[1] == "run_group":
+        sys.argv.pop(1)
         cfg = InterpArgs()
         run_from_grouped(cfg, cfg.load_interpret_autoencoder)
 
@@ -810,6 +857,6 @@ if __name__ == "__main__":
             run_folder(cfg)
         else:
             learned_dict = torch.load(cfg.load_interpret_autoencoder, map_location=cfg.device)
-            save_folder = f"/mnt/ssd-cluster/auto_interp_results/l{cfg.layer}_{cfg.layer_loc}"
+            save_folder = f"./mnt/ssd-cluster/auto_interp_results/l{cfg.layer}_{cfg.layer_loc}"
             cfg.save_loc = os.path.join(save_folder, cfg.load_interpret_autoencoder)
             run(learned_dict, cfg)

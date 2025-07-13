@@ -10,7 +10,7 @@ import torchopt
 import tqdm
 
 from config import EnsembleArgs
-from autoencoders.direct_coef_search import DirectCoefOptimizer
+#from autoencoders.direct_coef_search import DirectCoefOptimizer
 from autoencoders.ensemble import FunctionalEnsemble
 from autoencoders.mlp_tests import FunctionalPositiveTiedSAE
 from autoencoders.residual_denoising_autoencoder import (
@@ -48,7 +48,7 @@ def tied_vs_not_experiment(cfg: EnsembleArgs):
     dict_sizes = [cfg.activation_width * ratio for ratio in dict_ratios]
 
     ensembles = []
-    devices = [f"cuda:{i}" for i in range(8)]
+    devices = ["cuda:0"]
 
     for i in range(2):
         cfgs = product(l1_values[i * 2 : (i + 1) * 2], bias_decays)
@@ -233,7 +233,7 @@ def topk_experiment(cfg: EnsembleArgs):
     sparsity_levels = np.arange(1, 161, 10)
     dict_ratios = [0.5, 1, 2, 4, 0.5, 1, 2, 4]
     dict_sizes = [int(cfg.activation_width * ratio) for ratio in dict_ratios]
-    devices = [f"cuda:{i}" for i in range(8)]
+    devices = [f"cuda:{i}" for i in range(1)]
 
     ensembles = []
     for i in tqdm.tqdm(range(8)):
@@ -268,7 +268,7 @@ def synthetic_linear_range(cfg: EnsembleArgs):
     dict_sizes = [int(cfg.activation_width * ratio) for ratio in dict_ratios]
     settings = list(product([l1_vals[:16], l1_vals[16:]], dict_ratios))
 
-    devices = [f"cuda:{i}" for i in range(8)]
+    devices = [f"cuda:{i}" for i in range(1)]
 
     ensembles = []
     for i in tqdm.tqdm(range(8)):
@@ -293,7 +293,7 @@ def synthetic_linear_range(cfg: EnsembleArgs):
 
 def dense_l1_range_experiment(cfg: EnsembleArgs):
     l1_values = np.logspace(-4, -2, 16)
-    devices = [f"cuda:{i}" for i in range(8)]
+    devices = [f"cuda:{i}" for i in range(1)]
 
     ensembles = []
     for i in range(8):
@@ -340,7 +340,7 @@ def dense_l1_range_experiment(cfg: EnsembleArgs):
 
 def residual_denoising_experiment(cfg: EnsembleArgs):
     l1_values = np.logspace(-5, -3, 16)
-    devices = [f"cuda:{i}" for i in range(8)]
+    devices = [f"cuda:{i}" for i in range(1)]
 
     ensembles = []
     for i in range(4):
@@ -378,7 +378,7 @@ def residual_denoising_experiment(cfg: EnsembleArgs):
 
 def residual_denoising_comparison(cfg: EnsembleArgs):
     l1_values = np.logspace(-4, -2, 16)
-    devices = [f"cuda:{i}" for i in range(4)]
+    devices = [f"cuda:{i}" for i in range(1)]
 
     ensembles = []
     for i in range(4):
@@ -402,7 +402,7 @@ def residual_denoising_comparison(cfg: EnsembleArgs):
 
 def thresholding_experiment(cfg: EnsembleArgs):
     l1_values = np.logspace(-4, -2, 16)
-    devices = [f"cuda:{i}" for i in range(4)]
+    devices = [f"cuda:{i}" for i in range(1)]
 
     dict_ratio = 4
 
@@ -496,7 +496,7 @@ def run_resid_denoise() -> None:
 
 def zero_l1_baseline(cfg: EnsembleArgs):
     l1_values = np.array([0.0])
-    devices = ["cuda:1"]
+    devices = ["cuda:0"]
 
     ensembles = []
     cfgs = l1_values
@@ -547,7 +547,7 @@ def dict_ratio_experiment(cfg: EnsembleArgs):
 
     l1_value = 1e-3
 
-    devices = [f"cuda:{i}" for i in [1, 2, 3, 4, 6, 7]]
+    devices = [f"cuda:{i}" for i in [0]]
 
     ensembles = []
     for i in range(6):
@@ -852,7 +852,7 @@ def pythia_1_4_b_dict(cfg: EnsembleArgs):
     dict_ratio = 6
     l1_values = np.logspace(-4, -2, 5)
     dict_size = int(cfg.activation_width * dict_ratio)
-    devices = ["cuda:1"]
+    devices = ["cuda:0"]
 
     ensembles = []
     for i in range(1):
@@ -1202,13 +1202,17 @@ def simple_run() -> None:
     sweep(simple_setoff, cfg)
 
 
+
+
 def run_single_layer() -> None:
     cfg = EnsembleArgs()
-    cfg.model_name = "EleutherAI/pythia-70m-deduped"
-    cfg.dataset_name = "openwebtext"
+    # cfg.model_name = "EleutherAI/pythia-70m-deduped"
+    cfg.model_name = "EleutherAI/pythia-2.8b"
+    # cfg.dataset_name = "openwebtext"
+    cfg.dataset_name = "openai/gsm8k"
 
     cfg.batch_size = 1024
-    cfg.use_wandb = True
+    cfg.use_wandb = False
     cfg.wandb_images = False
     cfg.activation_width = 1024
     cfg.save_every = 5
@@ -1216,16 +1220,24 @@ def run_single_layer() -> None:
     cfg.n_epochs = 5
     cfg.tied_ae = True
     cfg.center_dataset = True
+    cfg.use_4bit = True
     for layer_loc in ["residual"]:
-        cfg.dataset_folder = f"owtchunks_zeromean_pythia70m_l{cfg.layer}_{layer_loc}"
+        cfg.dataset_folder = f"NoCoT_gsm8kchunks_zeromean_pythia2.8b_l{cfg.layer}_{layer_loc}"
+        # cfg.dataset_folder = f"CoT_gsm8kchunks_zeromean_pythia2.8b_l{cfg.layer}_{layer_loc}"
+        # cfg.dataset_folder = f"NoCoT_gsm8kchunks_zeromean_pythia70m_l{cfg.layer}_{layer_loc}"
+        # cfg.dataset_folder = f"CoT_gsm8kchunks_zeromean_pythia70m_l{cfg.layer}_{layer_loc}"
         # shutil.rmtree(cfg.dataset_folder)
-        for dict_ratio in [4, 8, 16, 32]:
+        # for dict_ratio in [4, 8, 16, 32]:
+        for dict_ratio in [4, 8]:
             cfg.layer_loc = layer_loc
             cfg.learned_dict_ratio = dict_ratio
 
             print(f"Running layer {cfg.layer}, layer location {layer_loc}, dict_ratio {dict_ratio}")
 
-            cfg.output_folder = f"/mnt/ssd-cluster/pythia70m_centered/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
+            cfg.output_folder = f"./mnt/ssd-cluster/pythia2.8b_centered_gsm8k_NoCoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
+            # cfg.output_folder = f"./mnt/ssd-cluster/pythia2.8b_centered_gsm8k_CoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
+            # cfg.output_folder = f"./mnt/ssd-cluster/pythia70m_centered_gsm8k_CoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
+            # cfg.output_folder = f"./mnt/ssd-cluster/pythia70m_centered_gsm8k_NoCoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
 
             print(f"Output folder: {cfg.output_folder}, dataset folder: {cfg.dataset_folder}")
 
@@ -1249,6 +1261,8 @@ def run_single_layer_gpt2() -> None:
     cfg.n_chunks = 10
     cfg.n_epochs = 4
     cfg.tied_ae = True
+    cfg.use_4bit = True
+
     for layer_loc in ["residual"]:
         cfg.dataset_folder = f"pilechunks_gpt2sm_l{cfg.layer}_{layer_loc}"
         # shutil.rmtree(cfg.dataset_folder)
@@ -1269,6 +1283,46 @@ def run_single_layer_gpt2() -> None:
             sweep(simple_setoff, cfg)
             
 
+def run_single_layer_new() -> None:
+
+    cfg = EnsembleArgs()
+
+    cfg.model_name = "NousResearch/Llama-2-7b-hf"
+    cfg.dataset_name = "openai/gsm8k"
+
+    cfg.batch_size = 4
+    cfg.use_wandb = False
+    cfg.wandb_images = False
+    # cfg.activation_width = 4096
+    cfg.save_every = 5
+    cfg.n_chunks = 5
+    cfg.n_epochs = 5
+    cfg.tied_ae = True
+    cfg.center_dataset = True
+    cfg.use_synthetic_dataset = False
+    cfg.dtype = torch.float32
+    cfg.lr = 1e-3
+
+    for layer_loc in ["residual"]:
+        cfg.layer = 2
+        cfg.layer_loc = layer_loc
+        cfg.dataset_folder = f"activation_data_llama2_7b_gsm8k_layer{cfg.layer}_{layer_loc}"
+        # shutil.rmtree(cfg.dataset_folder)
+        for dict_ratio in [4, 8, 16, 32]:
+            cfg.learned_dict_ratio = dict_ratio
+
+            print(f"Running layer {cfg.layer}, layer location {layer_loc}, dict_ratio {dict_ratio}")
+
+            cfg.output_folder = f"./mnt/ssd-cluster/llama2_7b_centered_gsm8k/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
+
+            print(f"Output folder: {cfg.output_folder}, dataset folder: {cfg.dataset_folder}")
+
+            sweep(simple_setoff, cfg)
+
+
+
+
+
 if __name__ == "__main__":
     # import sys
     # device = sys.argv[1]
@@ -1276,5 +1330,6 @@ if __name__ == "__main__":
     # sys.argv = sys.argv[:1]
     # run_all_zeros(device, layer)
     # setup_positives()
-    #run_single_layer()
-    run_pythia_1_4_b_sweep()
+    run_single_layer()
+    # run_pythia_1_4_b_sweep()
+    # run_single_layer_new()

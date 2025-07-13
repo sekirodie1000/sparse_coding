@@ -9,9 +9,9 @@ import torch
 import torch.nn as nn
 
 from baukit import Trace
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset, DownloadConfig
 from einops import rearrange
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
 from transformer_lens.loading_from_pretrained import get_official_model_name, convert_hf_model_config
@@ -26,6 +26,26 @@ MODEL_BATCH_SIZE = 4
 CHUNK_SIZE_GB = 2.0
 MAX_SENTENCE_LEN = 256
 
+FEW_SHOT_COT = """\
+Q: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?
+A: How many clips did Natalia sell in May? ** Natalia sold 48/2 = <<48/2=24>>24 clips in May.
+How many clips did Natalia sell altogether in April and May? ** Natalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May.
+#### 72
+
+Q: Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?
+A: How much does Weng earn per minute? ** Weng earns 12/60 = $<<12/60=0.2>>0.2 per minute.
+How much did Weng earn? ** Working 50 minutes, she earned 0.2 x 50 = $<<0.2*50=10>>10.
+#### 10
+
+Q: Betty is saving money for a new wallet which costs $100. Betty has only half of the money she needs. Her parents decided to give her $15 for that purpose, and her grandparents twice as much as her parents. How much more money does Betty need to buy the wallet?
+A: How much money does Betty have in the beginning? ** In the beginning, Betty has only 100 / 2 = $<<100/2=50>>50.
+How much money did Betty's grandparents give her? ** Betty's grandparents gave her 15 * 2 = $<<15*2=30>>30.
+How much more money does Betty need to buy the wallet? ** This means, Betty needs 100 - 50 - 30 - 15 = $<<100-50-30-15=5>>5 more.
+#### 5
+
+"""
+
+
 
 def check_use_baukit(model_name):
     if model_name in ["nanoGPT"]:
@@ -37,7 +57,10 @@ def check_use_baukit(model_name):
 
 
 def get_activation_size(model_name: str, layer_loc: str):
-    assert check_transformerlens_model(model_name) or model_name == "nanoGPT", f"Model {model_name} not supported"
+    # assert check_transformerlens_model(model_name) or model_name == "nanoGPT", f"Model {model_name} not supported"
+    if not (check_transformerlens_model(model_name) or model_name == "nanoGPT"):
+        print(f"[INFO] Assuming HuggingFace model: {model_name}")
+
     assert layer_loc in [
         "residual",
         "mlp",
@@ -58,12 +81,22 @@ def get_activation_size(model_name: str, layer_loc: str):
         return model_cfg["d_head"] * model_cfg["n_heads"]
 
 
+# def check_transformerlens_model(model_name: str):
+#     try:
+#         get_official_model_name(model_name)
+#         return True
+#     except ValueError:
+#         return False
+
 def check_transformerlens_model(model_name: str):
     try:
         get_official_model_name(model_name)
         return True
     except ValueError:
         return False
+    except Exception:
+        return False
+
 
 
 def make_tensor_name(layer: int, layer_loc: str, model_name: str) -> str:
@@ -75,33 +108,44 @@ def make_tensor_name(layer: int, layer_loc: str, model_name: str) -> str:
         "attn_concat",
         "mlpout",
     ], f"Layer location {layer_loc} not supported"
-    if layer_loc == "residual":
-        if check_transformerlens_model(model_name):
-            tensor_name = f"blocks.{layer}.hook_resid_post"
-        else:
-            raise NotImplementedError(f"Model {model_name} not supported for residual stream")
-    elif layer_loc == "attn_concat":
-        if check_transformerlens_model(model_name):
-            tensor_name = f"blocks.{layer}.attn.hook_z"
-        else:
-            raise NotImplementedError(f"Model {model_name} not supported for attention output")
-    elif layer_loc == "mlp":
-        if check_transformerlens_model(model_name):
-            tensor_name = f"blocks.{layer}.mlp.hook_post"
-        elif model_name == "nanoGPT":
-            tensor_name = f"transformer.h.{layer}.mlp.c_fc"
-        else:
-            raise NotImplementedError(f"Model {model_name} not supported for MLP")
-    elif layer_loc == "attn":
-        if check_transformerlens_model(model_name):
-            tensor_name = f"blocks.{layer}.hook_resid_post"
-        else:
-            raise NotImplementedError(f"Model {model_name} not supported for attention stream")
-    elif layer_loc == "mlpout":
-        if check_transformerlens_model(model_name):
-            tensor_name = f"blocks.{layer}.hook_mlp_out"
-        else:
-            raise NotImplementedError(f"Model {model_name} not supported for MLP")
+
+    if "llama" in model_name.lower():
+        if layer_loc == "residual":
+            return f"model.layers.{layer}.input_layernorm"
+        elif layer_loc == "mlp":
+            return f"model.layers.{layer}.mlp.gate_proj"
+        elif layer_loc == "attn":
+            return f"model.layers.{layer}.self_attn.q_proj"
+        elif layer_loc == "mlpout":
+            return f"model.layers.{layer}.post_attention_layernorm"
+    else:
+        if layer_loc == "residual":
+            if check_transformerlens_model(model_name):
+                tensor_name = f"blocks.{layer}.hook_resid_post"
+            else:
+                raise NotImplementedError(f"Model {model_name} not supported for residual stream")
+        elif layer_loc == "attn_concat":
+            if check_transformerlens_model(model_name):
+                tensor_name = f"blocks.{layer}.attn.hook_z"
+            else:
+                raise NotImplementedError(f"Model {model_name} not supported for attention output")
+        elif layer_loc == "mlp":
+            if check_transformerlens_model(model_name):
+                tensor_name = f"blocks.{layer}.mlp.hook_post"
+            elif model_name == "nanoGPT":
+                tensor_name = f"transformer.h.{layer}.mlp.c_fc"
+            else:
+                raise NotImplementedError(f"Model {model_name} not supported for MLP")
+        elif layer_loc == "attn":
+            if check_transformerlens_model(model_name):
+                tensor_name = f"blocks.{layer}.hook_resid_post"
+            else:
+                raise NotImplementedError(f"Model {model_name} not supported for attention stream")
+        elif layer_loc == "mlpout":
+            if check_transformerlens_model(model_name):
+                tensor_name = f"blocks.{layer}.hook_mlp_out"
+            else:
+                raise NotImplementedError(f"Model {model_name} not supported for MLP")
 
     return tensor_name
 
@@ -127,9 +171,37 @@ def make_sentence_dataset(dataset_name: str, max_lines: int = 20_000, start_line
                 os.system("curl https://the-eye.eu/public/AI/pile/train/00.jsonl.zst > pile0.zst")
                 os.system("unzstd pile0.zst")
         dataset = Dataset.from_list(list(read_from_pile("pile0", max_lines=max_lines, start_line=start_line)))
+    elif dataset_name == "openai/gsm8k":
+        print("Loading openai/gsm8k dataset...")
+        dataset = load_dataset(
+            dataset_name,
+            split="train",
+            verification_mode="no_checks",
+            download_mode="reuse_dataset_if_exists"
+        )
+
+        # dataset = dataset.map(lambda x: {"text": x["question"]})
+        dataset = dataset.map(lambda x: {"text": x["question"]}, remove_columns=[])
     else:
+        #download_config = DownloadConfig(read_timeout=300, retries=5)
         dataset = load_dataset(dataset_name, split="train")#, split=f"train[{start_line}:{start_line + max_lines}]")
     return dataset
+
+def make_sentence_dataset_with_cot(dataset_name: str, max_lines: int = 20_000, start_line: int = 0):
+    print("DATASET + CoT")
+    dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line)
+    def prepend_cot_prompt(example):
+        return {"text": FEW_SHOT_COT + f"Q: {example['text']}\nA:"}
+    return dataset.map(prepend_cot_prompt)
+
+def make_sentence_dataset_with_Nocot(dataset_name: str, max_lines: int = 20_000, start_line: int = 0):
+    print("DATASET + NoCoT")
+    dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line)
+    def prepend_Nocot_prompt(example):
+        return {"text": f"Q: {example['text']}\nA:"}
+    return dataset.map(prepend_Nocot_prompt)
+
+
 
 
 # Nora's Code from https://github.com/AlignmentResearch/tuned-lens/blob/main/tuned_lens/data.py
@@ -320,6 +392,78 @@ def make_activation_dataset(
             print(f"Saved undersized chunk {n_saved_chunks} of activations, total size:  {batch_idx * activation_size} ")
 
 
+# def make_activation_dataset_tl(
+#     sentence_dataset: DataLoader,
+#     model: HookedTransformer,
+#     activation_width: int,
+#     dataset_folders: List[str],
+#     layers: List[int] = [2],
+#     tensor_loc: str = "residual",
+#     chunk_size_gb: float = 2,
+#     device: torch.device = torch.device("cuda:0"),
+#     n_chunks: int = 1,
+#     max_length: int = 256,
+#     model_batch_size: int = 4,
+#     skip_chunks: int = 0,
+#     center_dataset: bool = False
+# ):
+    
+#     with torch.no_grad():
+#         chunk_size = chunk_size_gb * (2**30)  # 2GB
+#         activation_size = (
+#             activation_width * 2 * model_batch_size * max_length
+#         )  # 3072 mlp activations, 2 bytes per half, 1024 context window
+#         max_batches_per_chunk = int(chunk_size // activation_size)
+#         if center_dataset:
+#             chunk_means = {}
+
+#         batches_to_skip = skip_chunks * max_batches_per_chunk
+
+#         dataset_iterator = iter(sentence_dataset)
+
+#         n_activations = 0
+
+#         for _ in range(batches_to_skip):
+#             dataset_iterator.__next__()
+
+#         for chunk_idx in range(n_chunks):
+#             datasets: Dict[int, List] = {layer: [] for layer in layers}
+#             for batch_idx, batch in tqdm(enumerate(dataset_iterator)):
+#                 batch = batch["input_ids"].to(device)
+#                 _, cache = model.run_with_cache(batch, stop_at_layer=max(layers) + 1)
+#                 for layer in layers:
+#                     tensor_name = make_tensor_name(layer, tensor_loc, model.cfg.model_name)
+#                     activation_data = cache[tensor_name].to(torch.float16)
+#                     if tensor_loc == "attn_concat":
+#                         activation_data = rearrange(activation_data, "b s n d -> (b s) (n d)")
+#                     else:
+#                         activation_data = rearrange(activation_data, "b s n -> (b s) n")
+#                     if layer == layers[0]:
+#                         n_activations += activation_data.shape[0]
+#                     datasets[layer].append(activation_data)
+
+#                 if batch_idx >= max_batches_per_chunk:
+#                     break
+
+#             for layer, folder in zip(layers, dataset_folders):
+#                 dataset = datasets[layer]
+#                 if center_dataset:
+#                     if chunk_idx == 0:
+#                         chunk_means[layer] = torch.mean(torch.cat(dataset), dim=0)
+#                     dataset = [x - chunk_means[layer]  for x in dataset]
+#                 save_activation_chunk(dataset, chunk_idx, folder)
+
+#             if len(datasets[layer]) < max_batches_per_chunk:
+#                 print(f"Saved undersized chunk {chunk_idx} of activations, total size: {batch_idx * activation_size}")
+#                 break
+#             else:
+#                 print(f"Saved chunk {chunk_idx} of activations, total size: {(chunk_idx + 1) * batch_idx * activation_size}")
+    
+#     #return ((chunk_means, chunk_stds) if center_dataset else None, n_activations)
+#     return n_activations
+
+from pathlib import Path
+
 def make_activation_dataset_tl(
     sentence_dataset: DataLoader,
     model: HookedTransformer,
@@ -335,30 +479,30 @@ def make_activation_dataset_tl(
     skip_chunks: int = 0,
     center_dataset: bool = False
 ):
-    
     with torch.no_grad():
-        chunk_size = chunk_size_gb * (2**30)  # 2GB
+        chunk_size = chunk_size_gb * (2**30)
         activation_size = (
             activation_width * 2 * model_batch_size * max_length
-        )  # 3072 mlp activations, 2 bytes per half, 1024 context window
+        )
         max_batches_per_chunk = int(chunk_size // activation_size)
         if center_dataset:
             chunk_means = {}
 
         batches_to_skip = skip_chunks * max_batches_per_chunk
-
         dataset_iterator = iter(sentence_dataset)
-
         n_activations = 0
 
         for _ in range(batches_to_skip):
-            dataset_iterator.__next__()
+            next(dataset_iterator)
 
         for chunk_idx in range(n_chunks):
             datasets: Dict[int, List] = {layer: [] for layer in layers}
+            input_ids_storage = []
+
             for batch_idx, batch in tqdm(enumerate(dataset_iterator)):
-                batch = batch["input_ids"].to(device)
-                _, cache = model.run_with_cache(batch, stop_at_layer=max(layers) + 1)
+                input_ids = batch["input_ids"].to(device)
+                input_ids_storage.append(input_ids.cpu())
+                _, cache = model.run_with_cache(input_ids, stop_at_layer=max(layers) + 1)
                 for layer in layers:
                     tensor_name = make_tensor_name(layer, tensor_loc, model.cfg.model_name)
                     activation_data = cache[tensor_name].to(torch.float16)
@@ -378,17 +522,21 @@ def make_activation_dataset_tl(
                 if center_dataset:
                     if chunk_idx == 0:
                         chunk_means[layer] = torch.mean(torch.cat(dataset), dim=0)
-                    dataset = [x - chunk_means[layer]  for x in dataset]
+                    dataset = [x - chunk_means[layer] for x in dataset]
                 save_activation_chunk(dataset, chunk_idx, folder)
+
+                input_ids_tensor = torch.cat(input_ids_storage, dim=0)
+                input_ids_path = Path(folder) / f"input_ids_layer{layer}_chunk{chunk_idx}.pt"
+                torch.save(input_ids_tensor, input_ids_path)
 
             if len(datasets[layer]) < max_batches_per_chunk:
                 print(f"Saved undersized chunk {chunk_idx} of activations, total size: {batch_idx * activation_size}")
                 break
             else:
                 print(f"Saved chunk {chunk_idx} of activations, total size: {(chunk_idx + 1) * batch_idx * activation_size}")
-    
-    #return ((chunk_means, chunk_stds) if center_dataset else None, n_activations)
+
     return n_activations
+
 
 def make_activation_dataset_hf(
     sentence_dataset: Dataset,
@@ -524,8 +672,8 @@ def setup_data_new(
 
     print(f"Processing first {max_lines} lines of dataset...")
 
-    sentence_dataset = make_sentence_dataset(dataset_name, max_lines=max_lines)
-    tokenized_sentence_dataset, _ = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=max_length)
+    sentence_dataset = make_sentence_dataset_with_Nocot(dataset_name, max_lines=max_lines)
+    tokenized_sentence_dataset = simple_tokenize_per_sample(sentence_dataset, tokenizer, max_length=max_length)
     make_activation_dataset_hf(
         tokenized_sentence_dataset,
         model,
@@ -563,10 +711,10 @@ def setup_data(
     max_lines = int((chunk_size_gb * 1e9 * n_chunks) / (activation_width * sentence_len_lower * 2))
     print(f"Setting max_lines to {max_lines} to minimize sentences processed")
 
-    sentence_dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line)
+    sentence_dataset = make_sentence_dataset_with_Nocot(dataset_name, max_lines=max_lines, start_line=start_line)
     tensor_names = [make_tensor_name(layer, layer_loc, model.cfg.model_name) for layer in layers]
-    tokenized_sentence_dataset, bits_per_byte = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=MAX_SENTENCE_LEN)
-    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=MODEL_BATCH_SIZE, shuffle=True)
+    tokenized_sentence_dataset = simple_tokenize_per_sample(sentence_dataset, tokenizer, max_length=MAX_SENTENCE_LEN)
+    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=MODEL_BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     if baukit:
         assert type(dataset_folder) == str, "Baukit only supports single dataset folder"
         make_activation_dataset(
@@ -603,9 +751,29 @@ def setup_data(
         )
         return n_datapoints
 
+def simple_tokenize_per_sample(dataset, tokenizer, max_length=256):
+    def tokenize_fn(examples):
+        tokens = tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        return {"input_ids": tokens["input_ids"].squeeze(0)}
+
+    return dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names)
+
+def collate_fn(batch):
+    return {
+        "input_ids": torch.stack([torch.tensor(example["input_ids"]) for example in batch])
+    }
+
+
 
 def setup_token_data(cfg, tokenizer, model):
-    sentence_dataset = make_sentence_dataset(cfg.dataset_name)
-    tokenized_sentence_dataset, bits_per_byte = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=cfg.max_length)
-    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=cfg.model_batch_size, shuffle=True)
+    # sentence_dataset = make_sentence_dataset(cfg.dataset_name)
+    sentence_dataset = make_sentence_dataset_with_Nocot(cfg.dataset_name)
+    tokenized_sentence_dataset = simple_tokenize_per_sample(sentence_dataset, tokenizer, max_length=cfg.max_length)
+    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=cfg.model_batch_size, shuffle=True, collate_fn=collate_fn)
     return token_loader
