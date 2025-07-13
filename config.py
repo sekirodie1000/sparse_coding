@@ -44,7 +44,7 @@ class TrainArgs(BaseArgs):
     n_chunks: int = 30
     chunk_size_gb: float = 2.0
     batch_size: int = 256
-    use_wandb: bool = True
+    use_wandb: bool = False
     wandb_images: bool = False
     lr: float = 1e-3
     l1_alpha: float = 1e-3
@@ -56,6 +56,8 @@ class EnsembleArgs(TrainArgs):
     activation_width: int = 512
     use_synthetic_dataset: bool = False
     bias_decay: float = 0.0
+    n_repetitions: int = None
+    center_activations: bool = False
 
 @dataclass
 class SyntheticEnsembleArgs(EnsembleArgs):
@@ -71,7 +73,7 @@ class SyntheticEnsembleArgs(EnsembleArgs):
 @dataclass
 class ErasureArgs(BaseArgs):
     model_name: str = "EleutherAI/pythia-70m-deduped"
-    device: str = "cuda:4"
+    device: str = "cuda:0"
     layer: Optional[int] = None
     count_cutoff: int = 10000
     output_folder: str = "output_erasure_pca"
@@ -116,14 +118,14 @@ class InterpArgs(BaseArgs):
     layer_loc: str = "residual"
     device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
     n_feats_explain: int = 10
-    load_interpret_autoencoder: str = ""
+    load_interpret_autoencoder: str = "./mnt/ssd-cluster/pythia70m_centered_gsm8k/tied_residual_l2_r4/_0/learned_dicts.pt"
     tied_ae: bool = False
     interp_name: str = ""
     sort_mode: str = "max"
     use_decoder: bool = True
     df_n_feats: int = 200
     top_k: int = 50
-    save_loc: str = ""
+    save_loc: str = "./mnt/ssd-cluster/auto_interp_results_gsm8k/"
     
     
 @dataclass
